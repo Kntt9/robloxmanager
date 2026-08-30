@@ -1,0 +1,17 @@
+/target
+config.toml
+*.dat
+config.json
+*.log
+/references
+# Personal Claude Code settings. Contains a GitLab runner registration token.
+.claude/settings.local.json
+# GitLab runner machine identifier.
+.runner_system_id
+
+# Built executables live in /dist and are tracked so releases can be
+# downloaded without building. Everything else with a .exe extension is
+# ignored.
+*.exe
+!/dist/
+!/dist/*.exe
