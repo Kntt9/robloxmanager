@@ -5,6 +5,7 @@ pub mod group_panel;
 pub mod main_panel;
 pub mod presets_panel;
 pub mod private_servers;
+pub mod servers;
 pub mod settings;
 pub mod sidebar;
 pub mod stats;
@@ -19,6 +20,8 @@ const CHIP_NAME_MAX_CHARS: usize = 24;
 
 /// One row of preset quick-select chips, wrapping onto further rows as needed.
 /// Clicking a chip fills `place_id_input` / `job_id_input` from that preset.
+/// Returns `true` when a chip was clicked (so the caller can persist the
+/// launch target immediately).
 ///
 /// Two details keep the wrapping honest, and both were bugs before:
 ///
@@ -37,8 +40,11 @@ pub fn preset_chips(
     presets: &[LaunchPreset],
     place_id_input: &mut String,
     job_id_input: &mut String,
-) {
+) -> bool {
+    let old_place = place_id_input.clone();
+    let old_job = job_id_input.clone();
     chips_ui(ui, label, presets, place_id_input, job_id_input);
+    *place_id_input != old_place || *job_id_input != old_job
 }
 
 /// Body of [`preset_chips`], returning the rect of every chip so the layout

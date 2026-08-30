@@ -12,7 +12,7 @@ use ram_core::assets::{AssetKind, AssetState, ModerationStatus, OperationOutcome
 use crate::bridge::{BackendBridge, BackendCommand, BackendEvent, UploadJob};
 use crate::components::{
     asset_manager, exploits, games, group_panel, main_panel, presets_panel, private_servers,
-    settings, sidebar, stats, tutorial,
+    servers, settings, sidebar, stats, tutorial,
 };
 use crate::i18n;
 use crate::theme::ThemeUi;
@@ -466,6 +466,28 @@ pub struct AppState {
     confirm_permanent_delete: Option<usize>,
     /// True while the "empty trash" confirmation is being shown.
     confirm_empty_trash: bool,
+    /// Whether the servers panel is open.
+    servers_open: bool,
+    /// The servers panel's data cache, reset when the place ID changes.
+    servers_data: servers::ServersData,
+    /// Persistent UI state for the servers panel (sort, filter).
+    servers_state: servers::ServersState,
+    /// Monotonically increasing request counter for the servers panel. Every
+    /// new fetch increments it; the event handler only applies a response when
+    /// its sequence number matches the current one, so stale responses can
+    /// never clobber newer data.
+    servers_seq: u64,
+    /// Last launch target per account: `user_id -> (place_id, job_id, when)`.
+    ///
+    /// This is the *Manager's own* record of where it sent each account, kept
+    /// separate from the external presence API (which is polled and can be
+    /// stale or empty for a freshly launched client). The servers panel uses
+    /// this to build "Featured servers" without waiting for the API poll.
+    ///
+    /// `job_id` is `Some` only when the account was launched into a specific
+    /// server (from the Servers panel or a Job ID in the launch form); a plain
+    /// game launch has `None`. `when` is the wall-clock Instant of the launch.
+    launch_targets: HashMap<u64, (u64, Option<String>, std::time::Instant)>,
 
     /// Available update info: (version, release_url).
     update_available: Option<(String, String)>,
@@ -622,6 +644,11 @@ impl AppState {
             trash_open: false,
             confirm_permanent_delete: None,
             confirm_empty_trash: false,
+            servers_open: false,
+            servers_data: servers::ServersData::default(),
+            servers_state: servers::ServersState::default(),
+            servers_seq: 0,
+            launch_targets: HashMap::new(),
             update_available: None,
             show_changelog: false,
             tutorial: tutorial::TutorialState::default(),
@@ -1123,6 +1150,53 @@ impl AppState {
                     self.exploits_loading = false;
                     self.exploits_state.last_fetch = Some(std::time::Instant::now());
                 }
+                BackendEvent::ServersFetched {
+                    place_id,
+                    seq,
+                    servers: page,
+                    next_cursor,
+                    error,
+                } => {
+                    // Only apply responses that belong to the current
+                    // request epoch. A stale response for a previous refresh
+                    // or a different game must never clobber the live data.
+                    if self.servers_seq != seq
+                        || self.servers_data.place_id != Some(place_id)
+                    {
+                        tracing::debug!(
+                            "Ignoring stale servers response: seq {seq} vs current {}, \
+                             place {place_id} vs {:?}",
+                            self.servers_seq,
+                            self.servers_data.place_id,
+                        );
+                        continue;
+                    }
+                    self.servers_data.loading = false;
+                    self.servers_data.error = error.clone();
+                    if let Some(err) = &error {
+                        // Roblox's games API rate-limits aggressively. When we
+                        // get a rate-limit error, remember to wait before
+                        // allowing another request, so a quick "Try again"
+                        // click doesn't re-hammer an endpoint that is still
+                        // cooling down.
+                        let lower = err.to_lowercase();
+                        if lower.contains("rate") || lower.contains("429") {
+                            self.servers_data.retry_after = Some(
+                                std::time::Instant::now() + std::time::Duration::from_secs(15),
+                            );
+                        }
+                    }
+                    if self.servers_data.error.is_none() {
+                        // On success, replace the list (newer data from the
+                        // same refresh epoch). The event handler always
+                        // receives a fresh page from the initial cursor, so
+                        // we set instead of extend.
+                        self.servers_data.servers = page;
+                        self.servers_data.next_cursor = next_cursor;
+                        self.servers_data.fetched_at = Some(std::time::Instant::now());
+                        self.servers_data.retry_after = None;
+                    }
+                }
                 BackendEvent::GamePreviewResolved {
                     place_id,
                     name,
@@ -1164,6 +1238,25 @@ impl AppState {
                     self.roblox_instance_count = running_count;
                     self.roblox_running = running_count > 0;
                     self.retitle_roblox_windows();
+                    // An account that is no longer in the tracked-instance set
+                    // has closed its client (or was never attributed). Forget
+                    // its launch target so a stale "ESTÁ AQUI" highlight can't
+                    // outlive the process. The tracked set only contains
+                    // clients RM launched and attributed, which is exactly the
+                    // accounts in `launch_targets`.
+                    //
+                    // A brand-new launch is not in `tracked_instances` yet
+                    // (the sweep runs every couple of seconds), so we keep
+                    // targets younger than a grace window even when the sweep
+                    // hasn't caught up yet.
+                    const LAUNCH_GRACE: std::time::Duration =
+                        std::time::Duration::from_secs(20);
+                    let now = std::time::Instant::now();
+                    let live: std::collections::HashSet<u64> =
+                        self.tracked_instances.iter().map(|i| i.user_id).collect();
+                    self.launch_targets.retain(|user_id, (_, _, when)| {
+                        live.contains(user_id) || now.duration_since(*when) < LAUNCH_GRACE
+                    });
                 }
                 BackendEvent::AccountRevalidated {
                     user_id,
@@ -2302,6 +2395,9 @@ impl eframe::App for AppState {
         // ---- Trash panel ----
         self.show_trash_window(ctx);
 
+        // ---- Servers panel ----
+        self.show_servers_window(ctx);
+
         // ---- Confirmation before an asset upload batch ----
         self.show_upload_confirm_dialog(ctx);
 
@@ -2416,60 +2512,6 @@ impl AppState {
                             target_user_id,
                         } => {
                             self.join_account_server(user_id, target_user_id);
-                        }
-                        sidebar::SidebarAction::QuickLaunch(user_id) => {
-                            // Prefer the first saved preset (with its Job ID
-                            // if any); otherwise fall back to whatever's in
-                            // the launch inputs right now.
-                            let (place_id, job_id) = self
-                                .presets
-                                .first()
-                                .map(|(_, p)| (Some(p.place_id), p.job_id.clone()))
-                                .unwrap_or_else(|| {
-                                    let pid = self
-                                        .main_panel_state
-                                        .place_id_input
-                                        .parse::<u64>()
-                                        .ok();
-                                    let j = {
-                                        let t = self.main_panel_state.job_id_input.trim();
-                                        if t.is_empty() {
-                                            None
-                                        } else {
-                                            Some(t.to_string())
-                                        }
-                                    };
-                                    (pid, j)
-                                });
-                            if let Some(place_id) = place_id {
-                                let acc_lookup = self
-                                    .store
-                                    .find_by_id(user_id)
-                                    .map(|a| (a.user_id, a.encrypted_cookie.clone()));
-                                if let (Some((uid, enc)), Some(session)) =
-                                    (acc_lookup, self.session())
-                                {
-                                    if self.try_consume_launch_slot() {
-                                        self.bridge.send(BackendCommand::LaunchGame {
-                                            user_id: uid,
-                                            encrypted_cookie: enc,
-                                            session: session.clone(),
-                                            use_credential_manager: self.config.use_credential_manager,
-                                            place_id,
-                                            job_id,
-                                            link_code: None,
-                                            access_code: None,
-                                            multi_instance: self.config.multi_instance_enabled,
-                                            kill_background: self.config.kill_background_roblox,
-                                            privacy_mode: self.config.privacy_mode,
-                                        });
-                                    }
-                                }
-                            } else {
-                                self.toasts.push(Toast::error(
-                                    "No preset or Place ID set. Enter one first.",
-                                ));
-                            }
                         }
                         sidebar::SidebarAction::AssignGroup { user_ids, group } => {
                             for uid in &user_ids {
@@ -2777,6 +2819,9 @@ impl AppState {
                             }
                             main_panel::MainPanelAction::OpenPresets => {
                                 self.presets_open = true;
+                            }
+                            main_panel::MainPanelAction::OpenServers => {
+                                self.open_servers_panel();
                             }
                         }
                     }
@@ -5446,6 +5491,219 @@ impl AppState {
                 self.confirm_empty_trash = false;
             }
         }
+    }
+
+    /// Send a `FetchServers` command using the selected account's cookie so the
+    /// games API is authenticated (works far better than anonymous, and the
+    /// backend falls back to anonymous anyway if the cookie is dead).
+    fn send_fetch_servers(&self, place_id: u64, cursor: Option<String>, seq: u64) {
+        let account = self
+            .store
+            .accounts
+            .iter()
+            .find(|a| self.selected_ids.contains(&a.user_id))
+            .or_else(|| self.store.accounts.first());
+        let (user_id, encrypted_cookie) = match account {
+            Some(a) => (a.user_id, a.encrypted_cookie.clone()),
+            None => (0, None),
+        };
+        let session = self.session();
+        self.bridge.send(BackendCommand::FetchServers {
+            place_id,
+            cursor,
+            seq,
+            user_id,
+            encrypted_cookie,
+            session,
+            use_credential_manager: self.config.use_credential_manager,
+        });
+    }
+
+    /// Open the servers panel for the current Place ID.
+    fn open_servers_panel(&mut self) {
+        let raw = self.main_panel_state.place_id_input.trim();
+        let place_id = raw.parse::<u64>().ok();
+        self.servers_data = servers::ServersData {
+            place_id,
+            ..Default::default()
+        };
+        self.servers_open = true;
+        if let Some(pid) = place_id {
+            self.servers_seq += 1;
+            let seq = self.servers_seq;
+            self.servers_data.loading = true;
+            self.send_fetch_servers(pid, None, seq);
+        }
+    }
+
+    /// The servers panel floating window.
+    fn show_servers_window(&mut self, ctx: &egui::Context) {
+        if !self.servers_open {
+            return;
+        }
+
+        const SERVER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+        // If the Place ID changed since the panel last fetched, treat it as a
+        // new game: reset the cache and fetch fresh servers.
+        // If the cache is still fresh, skip the fetch entirely — the Roblox
+        // games API rate-limits aggressively after ~3 requests.
+        let current_pid = self
+            .main_panel_state
+            .place_id_input
+            .trim()
+            .parse::<u64>()
+            .ok();
+
+        let needs_fetch = current_pid.is_some()
+            && !self.servers_data.loading
+            && (
+                current_pid != self.servers_data.place_id
+                || self.servers_data.error.is_some()
+                || self.servers_data.servers.is_empty()
+                || self.servers_data.fetched_at.map_or(true, |t| t.elapsed() > SERVER_CACHE_TTL)
+            );
+
+        // Never fire a request while a rate-limit cooldown is active.
+        let cooled_down = self
+            .servers_data
+            .retry_after
+            .map_or(true, |t| t.elapsed() > std::time::Duration::ZERO);
+        let can_fetch = needs_fetch && cooled_down;
+
+        if can_fetch || current_pid != self.servers_data.place_id {
+            self.servers_data = servers::ServersData {
+                place_id: current_pid,
+                ..Default::default()
+            };
+            if let Some(pid) = current_pid {
+                self.servers_seq += 1;
+                let seq = self.servers_seq;
+                self.servers_data.loading = true;
+                self.send_fetch_servers(pid, None, seq);
+            }
+        }
+        let mut pending: Option<servers::ServersAction> = None;
+
+        egui::Window::new("\u{1f5a5}")
+            .id(egui::Id::new("servers_panel"))
+            .default_size([480.0, 500.0])
+            .min_size([360.0, 300.0])
+            .open(&mut self.servers_open)
+            .show(ctx, |ui| {
+                pending = servers::show(
+                    ui,
+                    &mut self.servers_state,
+                    &self.servers_data,
+                    &self.store,
+                    self.config.anonymize_names,
+                    &self.launch_targets,
+                );
+            });
+
+        let Some(action) = pending else {
+            return;
+        };
+        match action {
+            servers::ServersAction::Refresh(pid) => {
+                if self.servers_data.loading {
+                    return;
+                }
+                // Rate-limit cooldown: refuse to immediately re-fetch after a
+                // 429 so the user cannot hammer the API.
+                let cooled_down = self
+                    .servers_data
+                    .retry_after
+                    .map_or(true, |t| t.elapsed() > std::time::Duration::ZERO);
+                if !cooled_down {
+                    self.toasts.push(Toast::info(
+                        crate::i18n::tr(
+                            crate::i18n::Language::from_str(&self.config.language),
+                            "Rate limited. Try again in a moment.",
+                        ),
+                    ));
+                    return;
+                }
+                self.servers_seq += 1;
+                let seq = self.servers_seq;
+                self.servers_data = servers::ServersData {
+                    place_id: Some(pid),
+                    ..Default::default()
+                };
+                self.servers_data.loading = true;
+                self.send_fetch_servers(pid, None, seq);
+            }
+            servers::ServersAction::LoadMore(pid) => {
+                if self.servers_data.loading {
+                    return;
+                }
+                self.servers_seq += 1;
+                let seq = self.servers_seq;
+                self.servers_data.loading = true;
+                self.send_fetch_servers(pid, self.servers_data.next_cursor.clone(), seq);
+            }
+            servers::ServersAction::Join { place_id, job_id } => {
+                self.launch_into_server(place_id, job_id);
+            }
+            servers::ServersAction::Close => {
+                self.servers_open = false;
+            }
+        }
+    }
+
+    /// Launch into a specific server using the existing launch machinery, and
+    /// immediately record the account's presence so it shows up in the
+    /// "Featured servers" section of other accounts without waiting for the
+    /// next API presence poll.
+    fn launch_into_server(&mut self, place_id: u64, job_id: String) {
+        // Respect the configured launch delay, exactly like the main panel.
+        if !self.try_consume_launch_slot() {
+            return;
+        }
+        // The launch needs a real account with a cookie. Find the selected
+        // account; if none is selected, use the first account available.
+        let account = self
+            .store
+            .accounts
+            .iter()
+            .find(|a| self.selected_ids.contains(&a.user_id))
+            .or_else(|| self.store.accounts.first());
+        let Some(account) = account.cloned() else {
+            self.toasts
+                .push(Toast::error("Select an account to launch"));
+            return;
+        };
+        let Some(session) = self.session() else {
+            return;
+        };
+
+        // Record the launch target in the account's presence immediately so
+        // `highlighted_accounts()` in the servers panel can detect it without
+        // waiting for the external presence API (which may take seconds).
+        if let Some(acc) = self.store.find_by_id_mut(account.user_id) {
+            acc.last_presence.user_presence_type = 2;
+            acc.last_presence.place_id = Some(place_id);
+            acc.last_presence.game_id = Some(job_id.clone());
+        }
+        // The Manager's own record, independent of the external presence API.
+        self.launch_targets.insert(
+            account.user_id,
+            (place_id, Some(job_id.clone()), std::time::Instant::now()),
+        );
+
+        self.bridge.send(BackendCommand::LaunchGame {
+            user_id: account.user_id,
+            encrypted_cookie: account.encrypted_cookie.clone(),
+            session,
+            use_credential_manager: self.config.use_credential_manager,
+            place_id,
+            job_id: Some(job_id),
+            link_code: None,
+            access_code: None,
+            multi_instance: self.config.multi_instance_enabled,
+            kill_background: self.config.kill_background_roblox,
+            privacy_mode: self.config.privacy_mode,
+        });
     }
 
     /// The Exploits disclaimer modal — a centered overlay with a dark backdrop

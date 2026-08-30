@@ -372,6 +372,33 @@ fn pt_br(key: &'static str) -> Option<&'static str> {
         "Account permanently deleted" => "Conta exclu\u{00ED}da permanentemente",
         "Trash emptied" => "Lixeira esvaziada",
 
+        // ---- Servers panel ----
+        "Servers" => "Servidores",
+        "Game" => "Jogo",
+        "No game selected" => "Nenhum jogo selecionado",
+        "Enter a Place ID to view servers." => "Informe um Place ID para visualizar os servidores.",
+        "Sort by" => "Ordenar por",
+        "Lowest ping" => "Menor ping",
+        "Emptiest" => "Mais vazios",
+        "Fewest players" => "Menos jogadores",
+        "Most free slots" => "Mais vagas",
+        "Hide full servers" => "Ocultar servidores cheios",
+        "Featured servers" => "Servidores em destaque",
+        "is here" => "est\u{00E1} aqui",
+        "Join" => "Entrar",
+        "Available" => "Dispon\u{00ED}vel",
+        "Full" => "Cheio",
+        "players" => "jogadores",
+        "Load more" => "Carregar mais",
+        "Loading servers\u{2026}" => "Carregando servidores\u{2026}",
+        "No servers available at the moment." => "Nenhum servidor dispon\u{00ED}vel no momento.",
+        "Try again" => "Tentar novamente",
+        "Re-fetch servers" => "Recarregar servidores",
+        "Server" => "Servidor",
+        "Move account to trash" => "Mover conta para a lixeira",
+        "Open servers panel" => "Abrir painel de servidores",
+        "Rate limited. Try again in a moment." => "Limite de requisi\u{00E7}\u{00F5}es atingido. Tente novamente em instantes.",
+
         _ => return None,
     })
 }

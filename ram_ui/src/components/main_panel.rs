@@ -26,6 +26,8 @@ pub enum MainPanelAction {
     OpenBrowserAs(u64),
     /// Open the presets manager window.
     OpenPresets,
+    /// Open the servers panel for the current Place ID.
+    OpenServers,
 }
 
 /// Persistent input state for the main panel.
@@ -150,6 +152,18 @@ pub fn show(
                                     .clicked()
                                 {
                                     action = Some(MainPanelAction::OpenPresets);
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(format!("\u{1f5a5}  {}", t("Servers"))).size(15.0),
+                                        )
+                                        .min_size(egui::vec2(0.0, 32.0)),
+                                    )
+                                    .on_hover_text(t("Open servers panel"))
+                                    .clicked()
+                                {
+                                    action = Some(MainPanelAction::OpenServers);
                                 }
                                 if ui
                                     .add(
@@ -300,13 +314,19 @@ pub fn show(
                     if !presets.is_empty() {
                         let label = egui::RichText::new(t("Presets"))
                             .color(ui.visuals().weak_text_color());
-                        super::preset_chips(
+                        if super::preset_chips(
                             ui,
                             label,
                             presets,
                             &mut state.place_id_input,
                             &mut state.job_id_input,
-                        );
+                        ) {
+                            // A preset was just selected — persist the launch
+                            // target so it survives a restart.
+                            action = Some(MainPanelAction::SaveLaunchTarget {
+                                user_id: account.user_id,
+                            });
+                        }
                         ui.add_space(8.0);
                     }
 
@@ -803,12 +823,13 @@ fn draw_game_preview(
     preview_thumbs: Option<&Vec<u8>>,
 ) {
     let raw = state.place_id_input.trim();
-    let has_place = raw.parse::<u64>().is_ok();
-
-    // No valid place ID → show nothing, keep the card clean.
-    if !has_place {
+    let Ok(current_place) = raw.parse::<u64>() else {
         return;
-    }
+    };
+
+    let preview_is_current = preview.is_some_and(|p| p.place_id == current_place);
+    let thumbs_match = preview_is_current
+        && preview_thumbs.is_some_and(|b| !b.is_empty());
 
     let lang = ui.lang();
     let t = |key: &'static str| -> &'static str { crate::i18n::tr(lang, key) };
@@ -822,55 +843,50 @@ fn draw_game_preview(
         .fill(ui.visuals().faint_bg_color)
         .show(ui, |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
-                // Thumbnail (bytes delivered by the backend) or placeholder.
-                match preview_thumbs {
-                    Some(bytes) if !bytes.is_empty() => {
-                        let uri = format!("bytes://game_preview/{}", raw);
-                        ui.add(
-                            egui::Image::from_bytes(uri, bytes.clone())
-                                .fit_to_exact_size(thumb_size)
-                                .rounding(egui::Rounding::same(6.0)),
-                        );
-                    }
-                    _ => {
-                        let (rect, _) =
-                            ui.allocate_exact_size(thumb_size, egui::Sense::hover());
-                        ui.painter().rect_filled(
-                            rect,
-                            egui::Rounding::same(6.0),
-                            theme.surface,
-                        );
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "\u{1f3ae}",
-                            egui::FontId::proportional(20.0),
-                            theme.text_muted,
-                        );
-                    }
+                if thumbs_match {
+                    let uri = format!("bytes://game_preview/{current_place}");
+                    ui.add(
+                        egui::Image::from_bytes(uri, preview_thumbs.unwrap().clone())
+                            .fit_to_exact_size(thumb_size)
+                            .rounding(egui::Rounding::same(6.0)),
+                    );
+                } else {
+                    let (rect, _) =
+                        ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        egui::Rounding::same(6.0),
+                        theme.surface,
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{1f3ae}",
+                        egui::FontId::proportional(20.0),
+                        theme.text_muted,
+                    );
                 }
                 ui.add_space(10.0);
 
-                // Game name or status text.
                 ui.vertical(|ui| {
-                    if let Some(p) = preview {
-                        if p.name.is_empty() {
-                            ui.label(
-                                egui::RichText::new(t("Game not found for this Place ID."))
-                                    .small()
-                                    .color(theme.warning_text),
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new(&p.name)
-                                    .strong()
-                                    .size(14.0),
-                            );
-                            ui.label(
-                                egui::RichText::new(t("Ready to launch"))
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
+                    if preview_is_current {
+                        if let Some(p) = preview {
+                            if p.name.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(t("Game not found for this Place ID."))
+                                        .small()
+                                        .color(theme.warning_text),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(&p.name).strong().size(14.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new(t("Ready to launch"))
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
                         }
                     } else {
                         ui.spinner();

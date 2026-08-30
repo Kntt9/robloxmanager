@@ -122,8 +122,6 @@ pub enum SidebarAction {
     ShowPresets,
     /// Open the trash panel.
     OpenTrash,
-    /// Double-click: quick-launch this account.
-    QuickLaunch(u64),
     /// Open a webview pre-logged in as this account.
     OpenBrowserAs(u64),
     /// Assign accounts to a group (empty string = remove from group).
@@ -921,10 +919,6 @@ fn render_account_row(
             actions.push(SidebarAction::Select(account.user_id));
             state.last_clicked_index = Some(flat_idx);
         }
-    }
-
-    if response.double_clicked() {
-        actions.push(SidebarAction::QuickLaunch(account.user_id));
     }
 
     // Right-click context menu

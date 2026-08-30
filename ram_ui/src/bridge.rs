@@ -168,7 +168,20 @@ pub enum BackendCommand {
     SearchGames { query: String, limit: usize },
     /// Fetch the executor / exploit status feed from WEAO. Unauthenticated.
     FetchExploits,
-    /// Resolve a single place ID to a game preview (name + icon URL). Used by
+    /// Fetch one page of public servers for a place (Servers panel). Uses an
+    /// optional account cookie so the request is authenticated (Roblox's
+    /// games API works better with a logged-in session). The cookie is
+    /// decrypted on the backend thread, never sent over the channel in the
+    /// clear. Falls back to anonymous if the cookie fails.
+    FetchServers {
+        place_id: u64,
+        cursor: Option<String>,
+        seq: u64,
+        user_id: u64,
+        encrypted_cookie: Option<String>,
+        session: Option<crypto::StoreSession>,
+        use_credential_manager: bool,
+    },    /// Resolve a single place ID to a game preview (name + icon URL). Used by
     /// the Launch panel to confirm which game a Place ID points at.
     ResolveGamePreview { place_id: u64 },
     /// Check GitLab for a newer release.
@@ -397,6 +410,14 @@ pub enum BackendEvent {
     /// The WEAO exploit status feed was fetched.
     ExploitsFetched {
         exploits: Vec<ram_core::exploits_api::ExploitInfo>,
+        error: Option<String>,
+    },
+    /// One page of public servers was fetched for the Servers panel.
+    ServersFetched {
+        place_id: u64,
+        seq: u64,
+        servers: Vec<ram_core::api::GameServer>,
+        next_cursor: Option<String>,
         error: Option<String>,
     },
     /// A newer version is available on GitLab.
@@ -957,7 +978,7 @@ async fn handle_command(
                         }
                     }
                 };
-                match api::fetch_servers(client, &first_cookie, place_id, None).await {
+                match api::fetch_servers(client, &first_cookie, place_id, None, 25).await {
                     Ok((servers, _)) => {
                         if let Some(server) = servers.into_iter().next() {
                             info!("Bulk launch: resolved server {} ({}/{} players)",
@@ -1187,6 +1208,71 @@ async fn handle_command(
                         exploits: Vec::new(),
                         error: Some(e.to_string()),
                     })
+                }
+            }
+        }
+        BackendCommand::FetchServers {
+            place_id,
+            cursor,
+            seq,
+            user_id,
+            encrypted_cookie,
+            session,
+            use_credential_manager,
+        } => {
+            // Roblox's games API behaves much better with a logged-in session
+            // (the public server list needs it, per the KNT project's notes).
+            // Decrypt the selected account's cookie, but fall back to
+            // anonymous if anything fails — a dead cookie shouldn't block the
+            // server list.
+            let cookie = match session.as_ref() {
+                Some(s) => match decrypt_for(user_id, encrypted_cookie, s, use_credential_manager) {
+                    Ok(c) => c,
+                    Err(_) => String::new(),
+                },
+                None => String::new(),
+            };
+            match api::fetch_servers(client, &cookie, place_id, cursor.as_deref(), 50).await {
+                Ok((servers, next_cursor)) => Ok(BackendEvent::ServersFetched {
+                    place_id,
+                    seq,
+                    servers,
+                    next_cursor,
+                    error: None,
+                }),
+                Err(e) => {
+                    // If the authenticated call failed (rate limit / auth),
+                    // retry once anonymously before reporting the error.
+                    if !cookie.is_empty() {
+                        match api::fetch_servers(client, "", place_id, cursor.as_deref(), 50).await {
+                            Ok((servers, next_cursor)) => Ok(BackendEvent::ServersFetched {
+                                place_id,
+                                seq,
+                                servers,
+                                next_cursor,
+                                error: None,
+                            }),
+                            Err(e2) => {
+                                info!("Server fetch failed for place {place_id} (non-fatal): {e} -> {e2}");
+                                Ok(BackendEvent::ServersFetched {
+                                    place_id,
+                                    seq,
+                                    servers: Vec::new(),
+                                    next_cursor: None,
+                                    error: Some(e2.to_string()),
+                                })
+                            }
+                        }
+                    } else {
+                        info!("Server fetch failed for place {place_id} (non-fatal): {e}");
+                        Ok(BackendEvent::ServersFetched {
+                            place_id,
+                            seq,
+                            servers: Vec::new(),
+                            next_cursor: None,
+                            error: Some(e.to_string()),
+                        })
+                    }
                 }
             }
         }
@@ -1904,7 +1990,8 @@ mod tests {
             | C::FetchPopularGames { .. }
             | C::SearchGames { .. }
             | C::ResolveGamePreview { .. }
-            | C::FetchExploits => false,
+            | C::FetchExploits
+            | C::FetchServers { .. } => false,
         }
     }
 

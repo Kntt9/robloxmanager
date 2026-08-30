@@ -254,41 +254,112 @@ pub async fn fetch_game_icons(
 }
 
 // ---------------------------------------------------------------------------
-// Server list (for Job ID joining)
+// Server list (for Job ID joining + Servers panel)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameServer {
+    /// The server's Job ID (GUID used to join this exact server).
     pub id: String,
+    #[serde(default)]
     pub max_players: u32,
+    #[serde(default)]
     pub playing: u32,
+    #[serde(default)]
     pub fps: f32,
+    /// Real ping in ms, when the API provides it. `None` = not reported.
+    #[serde(default)]
     pub ping: Option<u32>,
 }
 
+impl GameServer {
+    /// True when the server is at capacity and has no free slot.
+    pub fn is_full(&self) -> bool {
+        self.playing >= self.max_players
+    }
+
+    /// Free slots remaining. Never negative (playing can briefly exceed max).
+    pub fn free_slots(&self) -> u32 {
+        self.max_players.saturating_sub(self.playing)
+    }
+}
+
+/// The servers response, parsed leniently: `data` may be missing/empty and
+/// `nextPageCursor` may be absent. Missing optional fields must never fail the
+/// whole page, or a single quirky server would hide every other.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerListResponse {
+    #[serde(default)]
     data: Vec<GameServer>,
+    #[serde(default)]
     next_page_cursor: Option<String>,
 }
 
 /// Fetch one page of public servers for a place.
+///
+/// `limit` must be one of the values the API accepts (10/25/50/100). The
+/// cursor is URL-encoded before being appended (the API returns a base64-ish
+/// token that can contain `+`, `/` and `=`, which must not be sent raw).
+///
+/// The body is read as text first and parsed manually so a non-JSON / error
+/// page is reported as a clear error with diagnostics instead of a generic
+/// "error decoding response body".
 pub async fn fetch_servers(
     client: &RobloxClient,
     cookie: &str,
     place_id: u64,
     cursor: Option<&str>,
+    limit: u32,
 ) -> Result<(Vec<GameServer>, Option<String>), CoreError> {
     let mut url = format!(
-        "https://games.roblox.com/v1/games/{place_id}/servers/0?sortOrder=Asc&limit=25"
+        "https://games.roblox.com/v1/games/{place_id}/servers/Public\
+         ?sortOrder=Asc&limit={limit}"
     );
     if let Some(c) = cursor {
-        url.push_str(&format!("&cursor={c}"));
+        // The cursor is a query value: percent-encode it.
+        url.push_str(&format!("&cursor={}", percent_encode(c)));
     }
-    let resp: ServerListResponse = client.get_json(&url, cookie).await?;
-    Ok((resp.data, resp.next_page_cursor))
+    tracing::debug!(
+        "[Servers] GET place {place_id} cursor {}",
+        cursor.unwrap_or("initial")
+    );
+
+    let text = client.get_text(&url, cookie).await?;
+    let parsed: ServerListResponse = match serde_json::from_str(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                "[Servers] place {place_id}: body not parseable ({} bytes): {e}",
+                text.len()
+            );
+            tracing::debug!(
+                "[Servers] place {place_id} body head: {}",
+                text.chars().take(300).collect::<String>()
+            );
+            return Err(CoreError::Json(e));
+        }
+    };
+    tracing::debug!(
+        "[Servers] place {place_id}: parsed {} servers",
+        parsed.data.len()
+    );
+    Ok((parsed.data, parsed.next_page_cursor))
+}
+
+/// Percent-encode a cursor value for safe inclusion in a URL query.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
