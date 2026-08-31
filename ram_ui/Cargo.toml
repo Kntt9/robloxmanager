@@ -5,7 +5,15 @@ edition = "2021"
 description = "GUI for KNT Manager"
 license = "MIT"
 repository = "https://gitlab.com/centerepic/robloxmanager"
-authors = ["RM Contributors"]
+authors = ["KNT Manager Contributors"]
+build = "build.rs"
+
+[[bin]]
+name = "KNT-Manager"
+path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 ram_core = { path = "../ram_core" }
