@@ -2,7 +2,7 @@
 name = "ram_ui"
 version = "1.9.0"
 edition = "2021"
-description = "GUI for RM — Roblox Account Manager"
+description = "GUI for KNT Manager"
 license = "MIT"
 repository = "https://gitlab.com/centerepic/robloxmanager"
 authors = ["RM Contributors"]

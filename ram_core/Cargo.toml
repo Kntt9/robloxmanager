@@ -2,7 +2,7 @@
 name = "ram_core"
 version = "1.9.0"
 edition = "2021"
-description = "Core library for RM - Roblox Account Manager"
+description = "Core library for KNT Manager"
 license = "MIT"
 repository = "https://gitlab.com/centerepic/robloxmanager"
 authors = ["RM Contributors"]

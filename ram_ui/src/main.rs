@@ -222,9 +222,9 @@ fn maybe_migrate_legacy_data(data_dir: &std::path::Path) {
     // Show a native dialog before the egui window opens
     let result = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Info)
-        .set_title("RM - Migrate Data")
+        .set_title("KNT Manager - Migrate Data")
         .set_description(
-            "RM now stores data in a standard location so it works \
+            "KNT Manager now stores data in a standard location so it works \
              no matter where the exe is placed.\n\n\
              Found existing data next to the exe. Move it to the new location?\n\n\
              • Yes: move files (recommended)\n\
@@ -341,8 +341,8 @@ fn main() {
 
     // Decode the embedded logo for the window icon.
     let icon = {
-        let png = include_bytes!("../../assets/Logo.png");
-        let img = image::load_from_memory(png).expect("failed to decode Logo.png");
+        let png = include_bytes!("../../assets/knt-logo.png");
+        let img = image::load_from_memory(png).expect("failed to decode knt-logo.png");
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         eframe::egui::IconData {
@@ -356,7 +356,7 @@ fn main() {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([config.window_width, config.window_height])
             .with_min_inner_size([640.0, 400.0])
-            .with_title(format!("RM | Roblox Manager v{}", env!("CARGO_PKG_VERSION")))
+            .with_title(format!("KNT Manager v{}", env!("CARGO_PKG_VERSION")))
             .with_icon(icon),
         ..Default::default()
     };
@@ -364,7 +364,7 @@ fn main() {
     let saved_lang = i18n::Language::from_str(&config.language);
 
     let _ = eframe::run_native(
-        "RM",
+        "KNT Manager",
         native_options,
         Box::new(move |cc| {
             // Enable image loading for egui_extras (avatars, etc.)

@@ -960,7 +960,7 @@ fn render_account_row(
                 );
                 if !can_kill {
                     kill.on_disabled_hover_text(
-                        "RM could not read this client's command line, so it cannot \
+                        "KNT Manager could not read this client's command line, so it cannot \
                          confirm the client belongs to this account. Use Kill All.",
                     );
                 } else if kill.clicked() {

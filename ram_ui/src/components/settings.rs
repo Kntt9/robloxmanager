@@ -274,7 +274,7 @@ pub fn show(
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(
-                    t("RM asks for it every time it starts. If you forget it, the accounts cannot be recovered."),
+                    t("KNT Manager asks for it every time it starts. If you forget it, the accounts cannot be recovered."),
                 )
                 .small()
                 .weak(),

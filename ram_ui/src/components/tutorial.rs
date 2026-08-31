@@ -116,8 +116,8 @@ impl TutorialState {
         // (title, body, show_next_btn, show_back_btn)
         match self.step {
             TutorialStep::Welcome => (
-                "Welcome to RM",
-                "RM lets you manage multiple Roblox accounts, launch games, and save \
+                "Welcome to KNT Manager",
+                "KNT Manager lets you manage multiple Roblox accounts, launch games, and save \
                  private servers, all from one window.\n\
                  Click Next to start the tour.",
                 true,

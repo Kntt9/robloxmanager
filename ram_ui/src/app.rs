@@ -841,7 +841,7 @@ impl AppState {
         // reason instead, and do not pretend the option was live.
         if !instance.attribution.is_exact() {
             self.toasts.push(Toast::error(
-                "RM could not read that client's command line, so it cannot \
+                "KNT Manager could not read that client's command line, so it cannot \
                  confirm which account it belongs to. Use Kill All instead.",
             ));
             return;
@@ -2050,8 +2050,8 @@ impl AppState {
             chrono::Local::now().format("%Y-%m-%d")
         );
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Export RM Accounts")
-            .add_filter("RM export", &["json"])
+            .set_title("Export KNT Manager Accounts")
+            .add_filter("KNT Manager export", &["json"])
             .set_file_name(&default_name)
             .save_file()
         else {
@@ -2098,8 +2098,8 @@ impl AppState {
             return;
         };
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Import RM Accounts")
-            .add_filter("RM export", &["json"])
+            .set_title("Import KNT Manager Accounts")
+            .add_filter("KNT Manager export", &["json"])
             .pick_file()
         else {
             return; // user cancelled
@@ -2320,7 +2320,7 @@ impl eframe::App for AppState {
                     if self.device_key_missing {
                         // No password exists for this store, so offering a
                         // password box would be a dead end. Say what happened.
-                        ui.heading("🔒 RM | Cannot Unlock On This PC");
+                        ui.heading("🔒 KNT Manager | Cannot Unlock On This PC");
                         ui.add_space(16.0);
                         ui.label(
                             "This account store unlocks automatically, but the key for it is \
@@ -2336,11 +2336,11 @@ impl eframe::App for AppState {
                             .weak(),
                         );
                     } else if self.unlocking {
-                        ui.heading("🔒 RM | Unlocking");
+                        ui.heading("🔒 KNT Manager | Unlocking");
                         ui.add_space(16.0);
                         ui.spinner();
                     } else {
-                        ui.heading("🔒 RM | Unlock Account Store");
+                        ui.heading("🔒 KNT Manager | Unlock Account Store");
                         ui.add_space(16.0);
                         ui.label("Enter your master password to decrypt accounts:");
                         ui.add_space(8.0);
@@ -6249,7 +6249,7 @@ impl AppState {
             .show(ctx, |ui| {
                 ui.set_max_width(430.0);
                 ui.label(
-                    "RM can unlock your accounts automatically on this PC, so you never have \
+                    "KNT Manager can unlock your accounts automatically on this PC, so you never have \
                      to type a master password again.",
                 );
                 ui.add_space(8.0);
