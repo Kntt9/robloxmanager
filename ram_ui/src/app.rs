@@ -2,7 +2,8 @@
 //! the sidebar, main panel, settings, toast system, and backend bridge together.
 
 use eframe::egui;
-use ram_core::models::{AccountStore, AppConfig, PrivateServer};
+use ram_core::api::GameServer;
+use ram_core::models::{AccountGroupStore, AccountStore, AppConfig, PrivateServer};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use ram_core::assets::{AssetKind, AssetState, ModerationStatus, OperationOutcome
 
 use crate::bridge::{BackendBridge, BackendCommand, BackendEvent, UploadJob};
 use crate::components::{
-    asset_manager, exploits, games, group_panel, main_panel, presets_panel, private_servers,
+    asset_manager, exploits, games, group_panel, groups, main_panel, presets_panel, private_servers,
     servers, settings, sidebar, stats, tutorial,
 };
 use crate::i18n;
@@ -145,13 +146,27 @@ fn attribution_summary(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Accounts,
-    PrivateServers,
     /// Only reachable while `config.developer_options` is on.
     AssetManager,
     Settings,
     Statistics,
     Games,
     Exploits,
+    /// Hub for server lookup and account groups.
+    Central,
+}
+
+/// Which sub-section the Central tab is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CentralSection {
+    Servers,
+    Groups,
+}
+
+impl Default for CentralSection {
+    fn default() -> Self {
+        CentralSection::Groups
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +504,22 @@ pub struct AppState {
     /// game launch has `None`. `when` is the wall-clock Instant of the launch.
     launch_targets: HashMap<u64, (u64, Option<String>, std::time::Instant)>,
 
+    // ---- Central tab: account groups ----
+    /// The persistent store of account groups, serialized to `groups.json`.
+    groups: AccountGroupStore,
+    /// Where `groups` lives on disk.
+    groups_path: PathBuf,
+    /// UI state for the groups area (modals, selections).
+    groups_state: groups::GroupsState,
+    /// Which Central sub-section is selected.
+    central_section: CentralSection,
+    /// Active "distribute across servers" run, if any.
+    distribute: Option<groups::DistributeState>,
+    /// Monotonically increasing request counter for the distribution server
+    /// fetches (separate from `servers_seq` so the Servers panel and a
+    /// distribution never clobber each other's responses).
+    distribute_seq: u64,
+
     /// Available update info: (version, release_url).
     update_available: Option<(String, String)>,
     /// Show the "What's New" changelog window.
@@ -649,6 +680,12 @@ impl AppState {
             servers_state: servers::ServersState::default(),
             servers_seq: 0,
             launch_targets: HashMap::new(),
+            groups: AccountGroupStore::default(),
+            groups_path: crate::data_dir().join("groups.json"),
+            groups_state: groups::GroupsState::default(),
+            central_section: CentralSection::default(),
+            distribute: None,
+            distribute_seq: 0,
             update_available: None,
             show_changelog: false,
             tutorial: tutorial::TutorialState::default(),
@@ -672,6 +709,9 @@ impl AppState {
 
         // Initial load of preset files from disk.
         state.reload_presets();
+
+        // Load saved account groups from disk.
+        state.groups = AccountGroupStore::load(&state.groups_path);
 
         // Reconcile any uploads left mid-flight by the previous run.
         state.recover_asset_index();
@@ -1016,10 +1056,24 @@ impl AppState {
                     // stays responsive to its last client rather than to its
                     // first.
                     self.last_launch_request = Some(std::time::Instant::now());
+                    // Route progress into an active distribution.
+                    if let Some(dist) = &mut self.distribute {
+                        if dist.phase == groups::DistributePhase::Launching {
+                            dist.launched = launched;
+                        }
+                    }
                     self.toasts
                         .push(Toast::info(format!("Launching {launched}/{total}...")));
                 }
                 BackendEvent::BulkLaunchComplete { launched, failed } => {
+                    // Route completion into an active distribution.
+                    if let Some(dist) = &mut self.distribute {
+                        if dist.phase == groups::DistributePhase::Launching {
+                            dist.launched = launched;
+                            dist.failed = failed;
+                            dist.phase = groups::DistributePhase::Done;
+                        }
+                    }
                     if failed == 0 {
                         self.toasts.push(Toast::success(format!(
                             "Bulk launch complete: {launched} launched"
@@ -1157,6 +1211,23 @@ impl AppState {
                     next_cursor,
                     error,
                 } => {
+                    // Route responses that belong to an active distribution
+                    // (separate sequence epoch) to the distribution machine
+                    // instead of the Servers panel.
+                    if let Some(dist) = &self.distribute {
+                        if dist.phase == groups::DistributePhase::Fetching
+                            && dist.seq == seq
+                            && dist.place_id == place_id
+                        {
+                            let cur_place = place_id;
+                            let cur_seq = seq;
+                            // Re-send only if the distribution is still on this
+                            // place AND epoch; otherwise drop.
+                            self.on_distribute_page(page, next_cursor, error);
+                            let _ = (cur_place, cur_seq);
+                            continue;
+                        }
+                    }
                     // Only apply responses that belong to the current
                     // request epoch. A stale response for a previous refresh
                     // or a different game must never clobber the live data.
@@ -1229,6 +1300,19 @@ impl AppState {
                             self.game_preview_thumbs.insert(place_id, thumb_bytes);
                         }
                     }
+                    // Sync any group whose Place ID was just resolved so the
+                    // card shows the real name + cover without a restart.
+                    for g in self.groups.groups.iter_mut() {
+                        if g.place_id == place_id && error.is_none() {
+                            if let Some(p) = self.game_preview_cache.get(&place_id) {
+                                g.game_name = p.name.clone();
+                            }
+                            if let Some(b) = self.game_preview_thumbs.get(&place_id) {
+                                g.game_thumb_bytes = b.clone();
+                            }
+                        }
+                    }
+                    self.save_groups();
                 }
                 BackendEvent::InstancesUpdated {
                     instances,
@@ -2316,7 +2400,7 @@ impl eframe::App for AppState {
             let t = |key: &'static str| -> &'static str { i18n::tr(lang, key) };
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Accounts, format!("📋 {}", t("Accounts")));
-                ui.selectable_value(&mut self.active_tab, Tab::PrivateServers, format!("🔒 {}", t("Private Servers")));
+                ui.selectable_value(&mut self.active_tab, Tab::Central, format!("\u{1f4e6} {}", t("Central")));
                 if self.config.developer_options {
                     ui.selectable_value(
                         &mut self.active_tab,
@@ -2372,7 +2456,7 @@ impl eframe::App for AppState {
 
         match self.active_tab {
             Tab::Accounts => self.show_accounts_tab(ctx),
-            Tab::PrivateServers => self.show_private_servers_tab(ctx),
+            Tab::Central => self.show_central_tab(ctx),
             Tab::AssetManager => self.show_asset_manager_tab(ctx),
             Tab::Settings => self.show_settings_tab(ctx),
             Tab::Statistics => self.show_stats_tab(ctx),
@@ -2397,6 +2481,14 @@ impl eframe::App for AppState {
 
         // ---- Servers panel ----
         self.show_servers_window(ctx);
+
+        // ---- Account group distribution ----
+        if self.distribute.is_some() {
+            let action = groups::show_distribution(ctx, self.distribute.as_ref().unwrap(), &self.store, self.config.anonymize_names);
+            if let Some(a) = action {
+                self.handle_groups_action(a);
+            }
+        }
 
         // ---- Confirmation before an asset upload batch ----
         self.show_upload_confirm_dialog(ctx);
@@ -2686,6 +2778,7 @@ impl AppState {
                                     use_credential_manager: self.config.use_credential_manager,
                                     place_id,
                                     job_id,
+                                    per_account_jobs: None,
                                     link_code: None,
                                     access_code: None,
                                     multi_instance: self.config.multi_instance_enabled,
@@ -2856,131 +2949,557 @@ impl AppState {
         });
     }
 
-    fn show_private_servers_tab(&mut self, ctx: &egui::Context) {
+    // ------------------------------------------------------------------
+    // Central tab — Servers (embedded) + Account Groups
+    // ------------------------------------------------------------------
+
+    fn show_central_tab(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let has_selection = !self.selected_ids.is_empty();
-            let action = private_servers::show(
-                ui,
-                &mut self.private_servers_state,
-                &self.config.private_servers,
-                has_selection,
-                &self.game_icon_bytes,
-            );
-            if let Some(a) = action {
-                match a {
-                    private_servers::PrivateServerAction::Add(server) => {
-                        let idx = self.config.private_servers.len();
-                        let place_id = server.place_id;
-                        let universe_id = server.universe_id;
-                        self.config.private_servers.push(server);
-                        let _ = self.config.save(&self.config_path);
-                        // Auto-resolve the place name
-                        self.bridge.send(BackendCommand::ResolvePlace {
+            let lang = i18n::of(ctx);
+            let t = |key: &'static str| -> &'static str { i18n::tr(lang, key) };
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.central_section,
+                    CentralSection::Servers,
+                    format!("\u{1f5a5}  {}", t("Private Servers")),
+                );
+                ui.selectable_value(
+                    &mut self.central_section,
+                    CentralSection::Groups,
+                    format!("\u{1f465}  {}", t("Account groups")),
+                );
+            });
+            ui.separator();
+            match self.central_section {
+                CentralSection::Servers => self.show_central_private_servers(ui),
+                CentralSection::Groups => self.show_central_groups(ui),
+            }
+        });
+    }
+
+    /// Private servers (saved launch shortcuts) inside the Central tab.
+    fn show_central_private_servers(&mut self, ui: &mut egui::Ui) {
+        let has_selection = !self.selected_ids.is_empty();
+        let action = private_servers::show(
+            ui,
+            &mut self.private_servers_state,
+            &self.config.private_servers,
+            has_selection,
+            &self.game_icon_bytes,
+        );
+        self.handle_private_server_action(action);
+    }
+
+    /// Account Groups section inside the Central tab.
+    fn show_central_groups(&mut self, ui: &mut egui::Ui) {
+        let actions = groups::show(
+            ui,
+            &mut self.groups_state,
+            &self.groups,
+            &self.store,
+            self.config.anonymize_names,
+            &self.tracked_instances,
+            &self.game_preview_thumbs,
+            &self.game_preview_cache,
+        );
+        // Resolve game preview for the modal's Place ID every frame.
+        if self.groups_state.modal_open {
+            if let Ok(pid) = self.groups_state.place_input.trim().parse::<u64>() {
+                self.maybe_resolve_place(pid);
+            }
+        }
+        for a in actions {
+            self.handle_groups_action(a);
+        }
+    }
+
+    /// Resolve a single place ID's game preview, reusing the same cache and
+    /// inflight set as the account card preview.
+    fn maybe_resolve_place(&mut self, place_id: u64) {
+        if self.game_preview_cache.contains_key(&place_id) { return; }
+        if self.game_preview_inflight.contains(&place_id) { return; }
+        self.game_preview_inflight.insert(place_id);
+        self.bridge.send(BackendCommand::ResolveGamePreview { place_id });
+    }
+
+    fn handle_groups_action(&mut self, a: groups::GroupsAction) {
+        let lang = i18n::Language::from_str(&self.config.language);
+        let t = |key: &'static str| -> &'static str { i18n::tr(lang, key) };
+        match a {
+            groups::GroupsAction::OpenCreate => {
+                self.groups_state.editing_id = None;
+                self.groups_state.name_input.clear();
+                self.groups_state.place_input.clear();
+                self.groups_state.selected_accounts.clear();
+                self.groups_state.modal_open = true;
+            }
+            groups::GroupsAction::OpenEdit(id) => {
+                if let Some(g) = self.groups.find_by_id(&id) {
+                    self.groups_state.editing_id = Some(id);
+                    self.groups_state.name_input = g.name.clone();
+                    self.groups_state.place_input = g.place_id.to_string();
+                    self.groups_state.selected_accounts = g.member_user_ids.iter().copied().collect();
+                    self.groups_state.modal_open = true;
+                }
+            }
+            groups::GroupsAction::CloseModal => {
+                self.groups_state.modal_open = false;
+            }
+            groups::GroupsAction::SaveGroup { id, name, place_id, member_user_ids } => {
+                if let Some(id) = id {
+                    if let Some(g) = self.groups.find_by_id_mut(&id) {
+                        g.name = name;
+                        g.place_id = place_id;
+                        g.member_user_ids = member_user_ids;
+                        g.updated_at = chrono::Utc::now();
+                        self.sync_group_game_info(&id);
+                    }
+                } else {
+                    let mut g = ram_core::models::AccountGroup::new(name, place_id);
+                    g.member_user_ids = member_user_ids;
+                    let gid = g.id.clone();
+                    self.groups.groups.push(g);
+                    self.sync_group_game_info(&gid);
+                }
+                self.groups_state.modal_open = false;
+                self.save_groups();
+                self.toasts.push(Toast::success(t("Group saved")));
+            }
+            groups::GroupsAction::RequestDelete(id) => {
+                self.groups_state.confirm_delete = Some(id);
+            }
+            groups::GroupsAction::ConfirmDelete(id) => {
+                self.groups.remove_by_id(&id);
+                self.groups_state.confirm_delete = None;
+                self.save_groups();
+                self.toasts.push(Toast::info(t("Group deleted")));
+            }
+            groups::GroupsAction::CancelDelete => {
+                self.groups_state.confirm_delete = None;
+            }
+            groups::GroupsAction::JoinTogether(group_id) => {
+                self.launch_group_together(&group_id);
+            }
+            groups::GroupsAction::RequestDistribute(group_id) => {
+                self.start_distribution(&group_id);
+            }
+            groups::GroupsAction::ConfirmDistribute => {
+                self.confirm_distribute();
+            }
+            groups::GroupsAction::CancelDistribute => {
+                self.distribute = None;
+            }
+            groups::GroupsAction::CloseDistribute => {
+                self.distribute = None;
+            }
+        }
+    }
+
+    /// Copy cached game info (name + thumbnail) into the group record.
+    fn sync_group_game_info(&mut self, group_id: &str) {
+        let id = group_id.to_owned();
+        let (place_id, needs_resolve) = {
+            let g = match self.groups.find_by_id(&id) {
+                Some(g) => g.clone(),
+                None => return,
+            };
+            (g.place_id, !self.game_preview_cache.contains_key(&g.place_id))
+        };
+        if let Some(p) = self.game_preview_cache.get(&place_id) {
+            if let Some(g) = self.groups.find_by_id_mut(&id) {
+                g.game_name = p.name.clone();
+            }
+        }
+        if let Some(b) = self.game_preview_thumbs.get(&place_id) {
+            if let Some(g) = self.groups.find_by_id_mut(&id) {
+                g.game_thumb_bytes = b.clone();
+            }
+        }
+        if needs_resolve && !self.game_preview_inflight.contains(&place_id) {
+            self.game_preview_inflight.insert(place_id);
+            self.bridge.send(BackendCommand::ResolveGamePreview { place_id });
+        }
+    }
+
+    /// Persist the groups store to disk.
+    fn save_groups(&self) {
+        let _ = self.groups.save(&self.groups_path);
+    }
+
+    /// Mode 1: launch every group member into the group's Place ID (no job).
+    fn launch_group_together(&mut self, group_id: &str) {
+        let Some(group) = self.groups.find_by_id(group_id).cloned() else { return; };
+        if group.place_id == 0 {
+            return;
+        }
+        let accounts: Vec<(u64, Option<String>)> = self.store.accounts.iter()
+            .filter(|a| group.member_user_ids.contains(&a.user_id))
+            .map(|a| (a.user_id, a.encrypted_cookie.clone()))
+            .collect();
+        if accounts.is_empty() { return; }
+        let Some(session) = self.session() else { return; };
+        // Use per-account jobs = None for each so the server-resolution path is
+        // skipped and each account launches by Place ID only (Roblox decides).
+        let per_account_jobs: Vec<Option<String>> = vec![None; accounts.len()];
+        // Record the launch target so "Featured servers" can show these
+        // accounts without waiting for the presence API.
+        let now = std::time::Instant::now();
+        for uid in accounts.iter().map(|a| a.0) {
+            if let Some(acc) = self.store.find_by_id_mut(uid) {
+                acc.last_presence.user_presence_type = 2;
+                acc.last_presence.place_id = Some(group.place_id);
+            }
+            self.launch_targets.insert(uid, (group.place_id, None, now));
+        }
+        self.bridge.send(BackendCommand::BulkLaunchEncrypted {
+            accounts,
+            session,
+            use_credential_manager: self.config.use_credential_manager,
+            place_id: group.place_id,
+            job_id: None,
+            per_account_jobs: Some(per_account_jobs),
+            link_code: None,
+            access_code: None,
+            multi_instance: self.config.multi_instance_enabled,
+            kill_background: self.config.kill_background_roblox,
+            privacy_mode: self.config.privacy_mode,
+            launch_delay_secs: self.config.launch_delay_secs,
+        });
+    }
+
+    // ---- Distribution state machine ----
+
+    /// Start a distribution for a group (shows the confirmation dialog).
+    fn start_distribution(&mut self, group_id: &str) {
+        use groups::{DistAccountState, DistAccountStatus, DistributePhase, DistributeState};
+        let Some(group) = self.groups.find_by_id(group_id).cloned() else { return; };        if group.place_id == 0 { return; }
+        let accounts: Vec<u64> = group.member_user_ids.clone();
+        let statuses: Vec<DistAccountStatus> = accounts.iter().map(|uid| {
+            let running = self.launch_targets.get(uid)
+                .map(|(p, _, _)| *p == group.place_id).unwrap_or(false);
+            DistAccountStatus { user_id: *uid, job_id: None, state: if running { DistAccountState::AlreadyRunning } else { DistAccountState::Waiting } }
+        }).collect();
+        let used: std::collections::HashSet<String> = accounts.iter()
+            .filter_map(|uid| self.launch_targets.get(uid))
+            .filter(|(p, _, _)| *p == group.place_id)
+            .filter_map(|(_, j, _)| j.clone())
+            .collect();
+        self.distribute = Some(DistributeState {
+            group_id: group.id.clone(),
+            place_id: group.place_id,
+            seq: 0,
+            phase: DistributePhase::Confirm,
+            accounts,
+            statuses,
+            collected: Vec::new(),
+            next_cursor: None,
+            pages: 0,
+            used_job_ids: used,
+            error: None,
+            launched: 0,
+            failed: 0,
+        });
+    }
+
+    /// User confirmed the distribution — start fetching servers.
+    fn confirm_distribute(&mut self) {
+        use groups::DistributePhase;
+        let (place_id, seq) = {
+            let Some(dist) = &mut self.distribute else { return; };
+            if dist.phase != DistributePhase::Confirm { return; }
+            dist.phase = DistributePhase::Fetching;
+            self.distribute_seq += 1;
+            let seq = self.distribute_seq;
+            dist.seq = seq;
+            (dist.place_id, seq)
+        };
+        self.send_fetch_servers_for(place_id, None, seq, None);
+    }
+
+    /// Handle a ServersFetched event for the active distribution.
+    fn on_distribute_page(&mut self, servers: Vec<GameServer>, next_cursor: Option<String>, error: Option<String>) {
+        use groups::{DistAccountState, DistributePhase, MAX_DISTRIBUTE_PAGES};
+        let Some(dist) = &mut self.distribute else { return; };
+        if dist.phase != DistributePhase::Fetching { return; }
+        if let Some(err) = error {
+            dist.error = Some(err);
+            dist.phase = DistributePhase::Done;
+            return;
+        }
+        for s in servers {
+            if s.is_full() { continue; }
+            if s.playing < 1 { continue; }
+            if dist.used_job_ids.contains(&s.id) { continue; }
+            if dist.collected.iter().any(|c| c.id == s.id) { continue; }
+            dist.collected.push(s);
+            if dist.collected.len() >= groups::MAX_COLLECTED_SERVERS { break; }
+        }
+        dist.pages += 1;
+        let needed = dist.statuses.iter().filter(|st| st.state == DistAccountState::Waiting).count();
+        let enough = dist.collected.len() >= needed;
+        let exhausted = next_cursor.is_none() || dist.pages >= MAX_DISTRIBUTE_PAGES;
+        if enough || exhausted {
+            // drop borrow before assign_and_launch
+            drop(dist);
+            self.assign_and_launch();
+        } else {
+            let cursor = next_cursor.clone();
+            let seq2 = dist.seq;
+            let pid = dist.place_id;
+            drop(dist);
+            self.send_fetch_servers_for(pid, cursor, seq2, None);
+        }
+    }
+
+    /// Assign servers to accounts and launch via BulkLaunchEncrypted.
+    fn assign_and_launch(&mut self) {
+        use groups::{DistAccountState, DistributePhase};
+        // Extract needed data before mutating.
+        let (place_id, data) = match &self.distribute {
+            Some(d) if d.phase == DistributePhase::Fetching => {
+                (d.place_id, (d.collected.clone(), d.used_job_ids.clone(), d.statuses.clone()))
+            }
+            _ => return,
+        };
+        let (collected, used, mut statuses) = data;
+        let mut used_job_ids = used;
+
+        // Iterate over a snapshot of the available (unused) servers so the
+        // mutable insert into `used_job_ids` doesn't conflict with the borrow.
+        let candidates: Vec<GameServer> = collected
+            .into_iter()
+            .filter(|s| !used_job_ids.contains(&s.id))
+            .collect();
+        let mut iter = candidates.iter();
+        for st in statuses.iter_mut() {
+            if st.state != DistAccountState::Waiting { continue; }
+            if let Some(srv) = iter.next() {
+                st.job_id = Some(srv.id.clone());
+                st.state = DistAccountState::Found;
+                used_job_ids.insert(srv.id.clone());
+            } else {
+                st.state = DistAccountState::NoServer;
+            }
+        }
+
+        let found: Vec<(u64, String)> = statuses.iter()
+            .filter_map(|st| match st.state {
+                DistAccountState::Found => st.job_id.as_ref().map(|j| (st.user_id, j.clone())),
+                _ => None,
+            })
+            .collect();
+
+        if found.is_empty() {
+            if let Some(dist) = &mut self.distribute {
+                dist.error = Some("Not enough compatible servers were found for all accounts.".to_string());
+                dist.phase = DistributePhase::Done;
+            }
+            return;
+        }
+
+        // Write back assigned statuses.
+        if let Some(dist) = &mut self.distribute {
+            dist.statuses = statuses.clone();
+            dist.used_job_ids = used_job_ids.clone();
+            dist.phase = DistributePhase::Launching;
+            dist.launched = 0;
+            dist.failed = 0;
+        }
+
+        // Mark Entering in the actual state.
+        if let Some(dist) = &mut self.distribute {
+            for st in dist.statuses.iter_mut() {
+                if st.state == DistAccountState::Found { st.state = DistAccountState::Entering; }
+            }
+        }
+
+        let accounts: Vec<(u64, Option<String>)> = found.iter().map(|(uid, _)| {
+            (*uid, self.store.find_by_id(*uid).and_then(|a| a.encrypted_cookie.clone()))
+        }).collect();
+        let per_account_jobs: Vec<Option<String>> = found.iter().map(|(_, j)| Some(j.clone())).collect();
+
+        let Some(session) = self.session() else {
+            if let Some(dist) = &mut self.distribute {
+                dist.error = Some("Unlock the account store first".to_string());
+                dist.phase = DistributePhase::Done;
+            }
+            return;
+        };
+
+        // Record the launch target so "Featured servers" can show each
+        // distributed account on its own server without waiting for the
+        // presence API.
+        let now = std::time::Instant::now();
+        for (uid, job) in &found {
+            if let Some(acc) = self.store.find_by_id_mut(*uid) {
+                acc.last_presence.user_presence_type = 2;
+                acc.last_presence.place_id = Some(place_id);
+                acc.last_presence.game_id = Some(job.clone());
+            }
+            self.launch_targets.insert(*uid, (place_id, Some(job.clone()), now));
+        }
+        self.bridge.send(BackendCommand::BulkLaunchEncrypted {
+            accounts,
+            session,
+            use_credential_manager: self.config.use_credential_manager,
+            place_id,
+            job_id: None,
+            per_account_jobs: Some(per_account_jobs),
+            link_code: None,
+            access_code: None,
+            multi_instance: self.config.multi_instance_enabled,
+            kill_background: self.config.kill_background_roblox,
+            privacy_mode: self.config.privacy_mode,
+            launch_delay_secs: self.config.launch_delay_secs,
+        });
+    }
+
+    /// Send a FetchServers command, optionally preferring a specific account.
+    fn send_fetch_servers_for(
+        &self,
+        place_id: u64,
+        cursor: Option<String>,
+        seq: u64,
+        prefer_user_id: Option<u64>,
+    ) {
+        let account = prefer_user_id
+            .and_then(|uid| self.store.find_by_id(uid))
+            .or_else(|| self.store.accounts.iter().find(|a| self.selected_ids.contains(&a.user_id)))
+            .or_else(|| self.store.accounts.first());
+        let (user_id, encrypted_cookie) = match account {
+            Some(a) => (a.user_id, a.encrypted_cookie.clone()),
+            None => (0, None),
+        };
+        let session = self.session();
+        self.bridge.send(BackendCommand::FetchServers {
+            place_id,
+            cursor,
+            seq,
+            user_id,
+            encrypted_cookie,
+            session,
+            use_credential_manager: self.config.use_credential_manager,
+        });
+    }
+
+    fn handle_private_server_action(
+        &mut self,
+        action: Option<private_servers::PrivateServerAction>,
+    ) {
+        let Some(a) = action else { return };
+        match a {
+            private_servers::PrivateServerAction::Add(server) => {
+                let idx = self.config.private_servers.len();
+                let place_id = server.place_id;
+                let universe_id = server.universe_id;
+                self.config.private_servers.push(server);
+                let _ = self.config.save(&self.config_path);
+                // Auto-resolve the place name
+                self.bridge.send(BackendCommand::ResolvePlace {
+                    place_id,
+                    universe_id,
+                    index: idx,
+                });
+                self.toasts.push(Toast::success("Private server added"));
+            }
+            private_servers::PrivateServerAction::Remove(idx) => {
+                if idx < self.config.private_servers.len() {
+                    self.config.private_servers.remove(idx);
+                    let _ = self.config.save(&self.config_path);
+                    self.toasts.push(Toast::info("Private server removed"));
+                }
+            }
+            private_servers::PrivateServerAction::Launch { place_id, link_code, access_code } => {
+                let ac = if access_code.is_empty() { None } else { Some(access_code.clone()) };
+                if self.selected_ids.len() == 1 {
+                    let uid = *self.selected_ids.iter().next().unwrap();
+                    let acc_lookup = self
+                        .store
+                        .find_by_id(uid)
+                        .map(|a| (a.user_id, a.encrypted_cookie.clone()));
+                    // Session first, so a locked store does not spend
+                    // the launch-delay slot on a launch that cannot
+                    // happen.
+                    let ready = self
+                        .session()
+                        .filter(|_| self.try_consume_launch_slot());
+                    if let (Some((user_id, enc)), Some(session)) = (acc_lookup, ready) {
+                        self.bridge.send(BackendCommand::LaunchGame {
+                            user_id,
+                            encrypted_cookie: enc,
+                            session,
+                            use_credential_manager: self.config.use_credential_manager,
                             place_id,
-                            universe_id,
-                            index: idx,
+                            job_id: None,
+                            link_code: Some(link_code.clone()),
+                            access_code: ac.clone(),
+                            multi_instance: self.config.multi_instance_enabled,
+                            kill_background: self.config.kill_background_roblox,
+                            privacy_mode: self.config.privacy_mode,
                         });
-                        self.toasts.push(Toast::success("Private server added"));
                     }
-                    private_servers::PrivateServerAction::Remove(idx) => {
-                        if idx < self.config.private_servers.len() {
-                            self.config.private_servers.remove(idx);
-                            let _ = self.config.save(&self.config_path);
-                            self.toasts.push(Toast::info("Private server removed"));
-                        }
-                    }
-                    private_servers::PrivateServerAction::Launch { place_id, link_code, access_code } => {
-                        let ac = if access_code.is_empty() { None } else { Some(access_code.clone()) };
-                        if self.selected_ids.len() == 1 {
-                            let uid = *self.selected_ids.iter().next().unwrap();
-                            let acc_lookup = self
-                                .store
-                                .find_by_id(uid)
-                                .map(|a| (a.user_id, a.encrypted_cookie.clone()));
-                            // Session first, so a locked store does not spend
-                            // the launch-delay slot on a launch that cannot
-                            // happen.
-                            let ready = self
-                                .session()
-                                .filter(|_| self.try_consume_launch_slot());
-                            if let (Some((user_id, enc)), Some(session)) = (acc_lookup, ready) {
-                                self.bridge.send(BackendCommand::LaunchGame {
-                                    user_id,
-                                    encrypted_cookie: enc,
-                                    session,
-                                    use_credential_manager: self.config.use_credential_manager,
-                                    place_id,
-                                    job_id: None,
-                                    link_code: Some(link_code.clone()),
-                                    access_code: ac.clone(),
-                                    multi_instance: self.config.multi_instance_enabled,
-                                    kill_background: self.config.kill_background_roblox,
-                                    privacy_mode: self.config.privacy_mode,
-                                });
-                            }
-                        } else if self.selected_ids.len() > 1 {
-                            let accounts: Vec<(u64, Option<String>)> = self
-                                .store
-                                .accounts
-                                .iter()
-                                .filter(|a| self.selected_ids.contains(&a.user_id))
-                                .map(|a| (a.user_id, a.encrypted_cookie.clone()))
-                                .collect();
-                            if let Some(session) = self.session() {
-                                self.bridge.send(BackendCommand::BulkLaunchEncrypted {
-                                    accounts,
-                                    session,
-                                    use_credential_manager: self.config.use_credential_manager,
-                                    place_id,
-                                    job_id: None,
-                                    link_code: Some(link_code),
-                                    access_code: ac,
-                                    multi_instance: self.config.multi_instance_enabled,
-                                    kill_background: self.config.kill_background_roblox,
-                                    privacy_mode: self.config.privacy_mode,
-                                    launch_delay_secs: self.config.launch_delay_secs,
-                                });
-                            }
-                        }
-                    }
-                    private_servers::PrivateServerAction::Resolve(idx) => {
-                        if let Some(server) = self.config.private_servers.get(idx) {
-                            self.bridge.send(BackendCommand::ResolvePlace {
-                                place_id: server.place_id,
-                                universe_id: server.universe_id,
-                                index: idx,
-                            });
-                        }
-                    }
-                    private_servers::PrivateServerAction::ResolveShareLink {
-                        share_code,
-                        server_name,
-                    } => {
-                        // Need an authenticated account to resolve share links
-                        let acc = self
-                            .store
-                            .accounts
-                            .first()
-                            .map(|a| (a.user_id, a.encrypted_cookie.clone()));
-                        if let (Some((first_user_id, enc)), Some(session)) = (acc, self.session()) {
-                            self.bridge.send(BackendCommand::ResolveShareLink {
-                                share_code,
-                                server_name,
-                                first_user_id,
-                                encrypted_cookie: enc,
-                                session,
-                                use_credential_manager: self.config.use_credential_manager,
-                            });
-                            self.toasts.push(Toast::info("Resolving share link..."));
-                        } else {
-                            self.toasts.push(Toast::error(
-                                "Add at least one account before using share links",
-                            ));
-                        }
+                } else if self.selected_ids.len() > 1 {
+                    let accounts: Vec<(u64, Option<String>)> = self
+                        .store
+                        .accounts
+                        .iter()
+                        .filter(|a| self.selected_ids.contains(&a.user_id))
+                        .map(|a| (a.user_id, a.encrypted_cookie.clone()))
+                        .collect();
+                    if let Some(session) = self.session() {
+                        self.bridge.send(BackendCommand::BulkLaunchEncrypted {
+                            accounts,
+                            session,
+                            use_credential_manager: self.config.use_credential_manager,
+                            place_id,
+                            job_id: None,
+                            per_account_jobs: None,
+                            link_code: Some(link_code),
+                            access_code: ac,
+                            multi_instance: self.config.multi_instance_enabled,
+                            kill_background: self.config.kill_background_roblox,
+                            privacy_mode: self.config.privacy_mode,
+                            launch_delay_secs: self.config.launch_delay_secs,
+                        });
                     }
                 }
             }
-        });
+            private_servers::PrivateServerAction::Resolve(idx) => {
+                if let Some(server) = self.config.private_servers.get(idx) {
+                    self.bridge.send(BackendCommand::ResolvePlace {
+                        place_id: server.place_id,
+                        universe_id: server.universe_id,
+                        index: idx,
+                    });
+                }
+            }
+            private_servers::PrivateServerAction::ResolveShareLink {
+                share_code,
+                server_name,
+            } => {
+                // Need an authenticated account to resolve share links
+                let acc = self
+                    .store
+                    .accounts
+                    .first()
+                    .map(|a| (a.user_id, a.encrypted_cookie.clone()));
+                if let (Some((first_user_id, enc)), Some(session)) = (acc, self.session()) {
+                    self.bridge.send(BackendCommand::ResolveShareLink {
+                        share_code,
+                        server_name,
+                        first_user_id,
+                        encrypted_cookie: enc,
+                        session,
+                        use_credential_manager: self.config.use_credential_manager,
+                    });
+                    self.toasts.push(Toast::info("Resolving share link..."));
+                } else {
+                    self.toasts.push(Toast::error(
+                        "Add at least one account before using share links",
+                    ));
+                }
+            }
+        }
     }
 
     /// Draw the presets manager as a floating window (opened from the Accounts

@@ -373,7 +373,83 @@ impl PopularGame {
     }
 }
 
-/// A saved private server for quick launching.
+/// A group of accounts that share a game and can be launched together.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountGroup {
+    /// Internal unique identifier (UUID v4).
+    pub id: String,
+    /// User-assigned name for this group.
+    pub name: String,
+    /// The Roblox place ID this group is configured for.
+    pub place_id: u64,
+    /// Cached game name, resolved from the Place ID.
+    #[serde(default)]
+    pub game_name: String,
+    /// Cached thumbnail bytes of the game, stored as PNG.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub game_thumb_bytes: Vec<u8>,
+    /// User IDs of the accounts in this group.
+    #[serde(default)]
+    pub member_user_ids: Vec<u64>,
+    /// When the group was created.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When the group was last modified.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl AccountGroup {
+    pub fn new(name: String, place_id: u64) -> Self {
+        let now = chrono::Utc::now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            place_id,
+            game_name: String::new(),
+            game_thumb_bytes: Vec::new(),
+            member_user_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// The persistent store of all account groups, serialized to disk as JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountGroupStore {
+    pub groups: Vec<AccountGroup>,
+}
+
+impl AccountGroupStore {
+    pub fn find_by_id(&self, id: &str) -> Option<&AccountGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    pub fn find_by_id_mut(&mut self, id: &str) -> Option<&mut AccountGroup> {
+        self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    pub fn remove_by_id(&mut self, id: &str) -> bool {
+        let before = self.groups.len();
+        self.groups.retain(|g| g.id != id);
+        self.groups.len() < before
+    }
+
+    /// Load from a JSON file, falling back to an empty store.
+    pub fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist to a JSON file via an atomic write so a crash never sees a
+    /// half-written groups file.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), crate::CoreError> {
+        let json = serde_json::to_string_pretty(self)?;
+        crate::storage::atomic_write(path, json.as_bytes())?;
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivateServer {
     /// User-assigned name for this private server.

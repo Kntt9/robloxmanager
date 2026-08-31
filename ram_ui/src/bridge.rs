@@ -140,6 +140,11 @@ pub enum BackendCommand {
         use_credential_manager: bool,
         place_id: u64,
         job_id: Option<String>,
+        /// Optional per-account Job IDs. When present (same length as
+        /// `accounts`), each account launches into that specific server
+        /// instead of the shared `job_id`. Used by Account Groups'
+        /// "Distribute across servers" mode.
+        per_account_jobs: Option<Vec<Option<String>>>,
         link_code: Option<String>,
         access_code: Option<String>,
         multi_instance: bool,
@@ -940,6 +945,7 @@ async fn handle_command(
             use_credential_manager,
             place_id,
             job_id,
+            per_account_jobs,
             link_code,
             access_code,
             multi_instance,
@@ -957,9 +963,17 @@ async fn handle_command(
                 process::clear_roblox_cookies();
             }
 
+            // "Distribute across servers" mode already picked a Job ID per
+            // account; those must be used verbatim and the shared-resolution
+            // path below is skipped.
+            let has_per_account_jobs =
+                per_account_jobs.as_ref().is_some_and(|j| !j.is_empty());
+
             // If no Job ID was provided and no link_code (private server), resolve
             // a public server so all accounts land in the same server.
-            let resolved_job_id = if job_id.is_some() || link_code.is_some() {
+            let resolved_job_id = if has_per_account_jobs {
+                None
+            } else if job_id.is_some() || link_code.is_some() {
                 job_id
             } else {
                 // Decrypt the first account's cookie to make the API call
@@ -1014,6 +1028,19 @@ async fn handle_command(
                     Ok(cookie) => {
                         match client.generate_auth_ticket(&cookie).await {
                             Ok(ticket) => {
+                                // Per-account Job ID (distribute mode) takes
+                                // precedence; otherwise fall back to the shared
+                                // resolved Job ID.
+                                let this_job = per_account_jobs
+                                    .as_ref()
+                                    .and_then(|jobs| jobs.get(i))
+                                    .cloned()
+                                    .flatten();
+                                let job = if this_job.is_some() {
+                                    this_job.as_deref()
+                                } else {
+                                    resolved_job_id.as_deref()
+                                };
                                 // Snapshot before each launch in the batch, not
                                 // once for the batch: by the time account three
                                 // goes out, accounts one and two have clients
@@ -1022,7 +1049,7 @@ async fn handle_command(
                                 if let Err(e) = process::launch_game(
                                     &ticket,
                                     place_id,
-                                    resolved_job_id.as_deref(),
+                                    job,
                                     link_code.as_deref(),
                                     access_code.as_deref(),
                                     launchtime,
@@ -1329,7 +1356,10 @@ async fn handle_command(
         }
         BackendCommand::ResolvePlace { place_id, universe_id, index } => {
             // Both the game name and icon endpoints work without auth when we
-            // have a universe_id. If we don't, we can't resolve without auth.
+            // have a universe_id. When we don't (e.g. a private server added
+            // via the full /games/PLACE_ID?privateServerLinkCode= URL), resolve
+            // place → universe through the public preview endpoint — exactly
+            // like the Launch panel does — so the cover still loads.
             if let Some(uid) = universe_id {
                 let name = api::resolve_universe_name(client, uid).await
                     .unwrap_or_default();
@@ -1348,8 +1378,30 @@ async fn handle_command(
                 };
                 Ok(BackendEvent::PlaceResolved { index, place_name: name, place_id, icon_bytes })
             } else {
-                // No universe_id — cannot resolve without auth. Return empty.
-                Ok(BackendEvent::PlaceResolved { index, place_name: String::new(), place_id, icon_bytes: None })
+                match api::resolve_game_preview(client, place_id).await {
+                    Ok(preview) => {
+                        let icon_bytes = if preview.thumb_url.is_empty() {
+                            None
+                        } else {
+                            client.get_bytes(&preview.thumb_url, "").await.ok()
+                        };
+                        Ok(BackendEvent::PlaceResolved {
+                            index,
+                            place_name: preview.name,
+                            place_id,
+                            icon_bytes,
+                        })
+                    }
+                    Err(e) => {
+                        info!("Place resolve failed for place {place_id} (non-fatal): {e}");
+                        Ok(BackendEvent::PlaceResolved {
+                            index,
+                            place_name: String::new(),
+                            place_id,
+                            icon_bytes: None,
+                        })
+                    }
+                }
             }
         }
         BackendCommand::BrowseAsAccount {

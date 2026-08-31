@@ -15,4 +15,6 @@ pub mod storage;
 pub mod transfer;
 
 pub use error::CoreError;
-pub use models::{Account, AccountStore, AppConfig};
+pub use models::{
+    Account, AccountGroup, AccountGroupStore, AccountStore, AppConfig,
+};

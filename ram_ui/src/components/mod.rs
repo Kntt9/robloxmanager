@@ -2,6 +2,7 @@ pub mod asset_manager;
 pub mod exploits;
 pub mod games;
 pub mod group_panel;
+pub mod groups;
 pub mod main_panel;
 pub mod presets_panel;
 pub mod private_servers;
